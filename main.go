@@ -1,21 +1,82 @@
 package main
 
 import (
-  "fmt"
+	"errors"
+	"log"
+	"os"
+	"runtime/debug"
+	"strings"
+	"time"
+
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
 
-//TIP <p>To run your code, right-click the code and select <b>Run</b>.</p> <p>Alternatively, click
-// the <icon src="AllIcons.Actions.Execute"/> icon in the gutter and select the <b>Run</b> menu item from here.</p>
+func vcsFromBuildInfo() (repoURL, commit string, modified bool) {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				commit = s.Value
+			case "vcs.modified":
+				modified = (s.Value == "true")
+			}
+		}
+		mp := info.Main.Path
+		if strings.HasPrefix(mp, "github.com/") ||
+			strings.HasPrefix(mp, "gitlab.com/") ||
+			strings.HasPrefix(mp, "bitbucket.org/") {
+			repoURL = "https://" + mp
+		}
+	}
+	return
+}
 
 func main() {
-  //TIP <p>Press <shortcut actionId="ShowIntentionActions"/> when your caret is at the underlined text
-  // to see how GoLand suggests fixing the warning.</p><p>Alternatively, if available, click the lightbulb to view possible fixes.</p>
-  s := "gopher"
-  fmt.Printf("Hello and welcome, %s!\n", s)
+	svc := os.Getenv("DD_SERVICE")
+	if svc == "" {
+		svc = "go-apm-min"
+	}
+	env := os.Getenv("DD_ENV")
 
-  for i := 1; i <= 5; i++ {
-	//TIP <p>To start your debugging session, right-click your code in the editor and select the Debug option.</p> <p>We have set one <icon src="AllIcons.Debugger.Db_set_breakpoint"/> breakpoint
-	// for you, but you can always add more by pressing <shortcut actionId="ToggleLineBreakpoint"/>.</p>
-	fmt.Println("i =", 100/i)
-  }
+	repoURL, commit, modified := vcsFromBuildInfo()
+	log.Printf("BuildVCS: repo=%s commit=%s modified=%v", repoURL, commit, modified)
+
+	// Start the Datadog tracer (defaults to sending to local agent at 127.0.0.1:8126).
+	tracer.Start(
+		tracer.WithService(svc),
+		tracer.WithEnv(env),
+	)
+	defer tracer.Stop()
+
+	log.Printf("Datadog tracer started (service=%s env=%s). Emitting a span every 30s...", svc, env)
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	// Emit a simple custom span every 30 seconds
+	i := 0
+	for {
+		i++
+		span := tracer.StartSpan("heartbeat",
+			tracer.ResourceName("heartbeat"),
+			tracer.Tag("component", "demo"),
+		)
+		// Simulate a small bit of work
+		time.Sleep(100 * time.Millisecond)
+
+		if i%3 == 0 {
+			err := errors.New("simulated failure: database timeout")
+			span.SetTag(ext.Error, err)                       // kratko
+			span.SetTag("error.type", "TimeoutError")         // tip
+			span.SetTag("error.msg", err.Error())             // poruka
+			span.SetTag("error.stack", string(debug.Stack())) // stack (bitno za grupisanje)
+			span.Finish(tracer.WithError(err))
+			log.Println("sent ERROR span")
+		} else {
+			span.Finish()
+			log.Println("sent OK span")
+		}
+		<-ticker.C
+	}
 }
